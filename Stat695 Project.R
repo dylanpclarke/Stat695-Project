@@ -61,6 +61,7 @@ quantile(nhefs$age[nhefs$qsmk == 1])
 quantile(nhefs$age[nhefs$qsmk == 0])
 
 nhefs$survival = with(nhefs,Surv(surv,death))
+write.csv(nhefs,"~/R/win-library/4.0/Causal Survival/nhefs.csv")
 
 aalen_model = aareg(survival~wt71 + income + sex + age + smokeintensity + smokeyrs + qsmk,
       data = nhefs)
