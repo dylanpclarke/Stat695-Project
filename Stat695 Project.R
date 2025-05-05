@@ -3,6 +3,7 @@ library(survival)
 library(ggplot2)
 library(tidyverse)
 library(ggsurvfit)
+library(timereg)
 nhefs = causaldata::nhefs_complete
 
 table(nhefs$qsmk)
