@@ -22,10 +22,16 @@ library("survminer")
 library("splitstackshape")
 library(olsrr)
 library(ipw)
+library(timereg)
+library(MatchIt)
+library(xtable)
+library(rifttable)
+library(confintr)
 
 setwd("~/R/win-library/4.0/Causal Survival")
 
 nhefs = causaldata::nhefs_complete
+nhefs = subset(nhefs,!is.na(nhefs$income))
 ```
 
 Now we clean the data a bit to get it ready. This creates the survival variable we will use.
@@ -40,16 +46,6 @@ nhefs$survival = with(nhefs,Surv(surv,death))
 
 nhefs$survtime <- ifelse(nhefs$death==0, 120, 
                          (nhefs$yrdth-83)*12+nhefs$modth)
-```
-
-We also create a second subject-time dataset.
-
-```{r subject time data}
-nhefs.surv <- expandRows(nhefs, "survtime", drop=F) 
-nhefs.surv$time <- sequence(rle(nhefs.surv$seqn)$lengths)-1
-nhefs.surv$event <- ifelse(nhefs.surv$time==nhefs.surv$survtime-1 & 
-                             nhefs.surv$death==1, 1, 0)
-nhefs.surv$timesq <- nhefs.surv$time^2
 ```
 
 ## Inital Exploration of the Data
@@ -145,35 +141,35 @@ nhefs$pn.qsmk <- predict(p.num, nhefs, type="response")
 # computation of estimated weights
 nhefs$sw.a2 <- ifelse(nhefs$qsmk==1, nhefs$pn.qsmk/nhefs$pd.qsmk,
                      (1-nhefs$pn.qsmk)/(1-nhefs$pd.qsmk))
-summary(nhefs$sw.a)
+
+# estimation of denominator of ip weights
+p.denom <- glm(qsmk ~ age + sex + wt71 +income + smokeintensity + smokeyrs, 
+               data=nhefs, family=binomial())
+nhefs$pd.qsmk <- predict(p.denom, nhefs, type="response")
+
+# estimation of numerator of ip weights
+p.num <- glm(qsmk ~ 1, data=nhefs, family=binomial())
+nhefs$pn.qsmk <- predict(p.num, nhefs, type="response")
+
+# computation of estimated weights
+nhefs$sw.a <- ifelse(nhefs$qsmk==1, nhefs$pn.qsmk/nhefs$pd.qsmk,
+                     (1-nhefs$pn.qsmk)/(1-nhefs$pd.qsmk))
 ```
 
-## Propensity Scores
-
-```{r}
-qsmk_mod = glm(qsmk~ sex + race + age + school + ht + wt82 + wt82_71 + smokeintensity + smokeyrs + pepticulcer + alcoholpy + otherpain  + exercise + marital,
-               data = nhefs, family = binomial)
-
-nhefs$p = fitted(qsmk_mod)
-```
-
-
-## Aalen Model
+## Aalen Model Discarded Attempt
 
 ```{r aalen}
 #Baseline Aalen
 aalen_model_uw = aareg(survival~ qsmk + sex + race + age + school + ht + wt82 + wt82_71 + smokeintensity + smokeyrs + pepticulcer + alcoholpy + otherpain  + exercise + marital,
       data = nhefs)
 
-aalen_model_uw_2 = aareg(survival~ qsmk + sex + age + wt82_71 + marital,
-      data = nhefs)
+summary(aalen_model_uw)
 
 times = aalen_model_uw$times
 
-saa = summary(aalen_model_uw)
-saa2 = summary(aalen_model_uw_2)
-
 coef = aalen_model_uw$coefficient
+
+aalen_model_uw
 
 Lambda0 = coef[,"Intercept"]
 Bqmk = coef[, "qsmk"]
@@ -231,23 +227,68 @@ for (j in seq_along(times)) {
     BE2[j]*(nhefs$exercise == 2) +
     BM[j]*nhefs$marital
   
-  S0_mat[, j] <- exp(-Lambda0[j] - linpred0)
+  S0_mat[, j] <- exp(Lambda0[j] + linpred0)
+  S1_mat[, j] <- exp(Lambda0[j] + linpred1)
+}
+
+S0 <- colMeans(S0_mat,na.rm = TRUE)
+S1 <- colMeans(S1_mat, na.rm = TRUE)
+
+cumprod(S0)
+cumprod(S1)
+
+
+#IPW Aalen
+aalen_model_w = aareg(survival~ qsmk,
+      data = nhefs, weights = sw.a2)
+
+times = aalen_model_w$times
+
+coef = aalen_model_w$coefficient
+
+Lambda0 = coef[,"Intercept"]
+Bqmk = coef[, "qsmk"]
+
+n = nrow(nhefs)
+S0_mat = matrix(0, nrow = n, ncol = length(times))
+S1_mat = matrix(0, nrow = n, ncol = length(times))
+
+for (j in seq_along(times)) {
+  linpred1 = Bqmk[j] 
+  
+  S0_mat[, j] <- exp(-Lambda0[j])
   S1_mat[, j] <- exp(-Lambda0[j] - linpred1)
 }
 
 S0 <- colMeans(S0_mat,na.rm = TRUE)
 S1 <- colMeans(S1_mat, na.rm = TRUE)
 
-tau = max(times)
+cumprod(S0)[291]
+cumprod(S1)[291]
 
-rmst0 = sum( (S0[-1] + S0[-length(S0)])/2 * diff(times) )
-rmst1 = sum( (S1[-1] + S1[-length(S1)])/2 * diff(times) )
+surv_diff_aalen_w = cumprod(S1)[291] - cumprod(S0)[291]
 
-ate_rmst = rmst1 - rmst0
+#Bootstrap:
+bootaalen <- function(){
+  sam = sample(nhefs$seqn,length(unique(nhefs$seqn)),replace = TRUE)
+   data = nhefs %>% filter(seqn %in% sam)
+  data <- df_bs %>%
+    group_by(seqn) %>%
+    mutate(dup = sum(seqn == sam)) %>%
+    ungroup() %>%
+    uncount(weights = dup)
+  p.denom <- glm(qsmk ~ sex + race + age + school + ht + wt82 + wt82_71 + smokeintensity + smokeyrs + pepticulcer + alcoholpy + otherpain  + exercise + marital, 
+               data=data, family=binomial())
+data$pd.qsmk <- predict(p.denom, data, type="response")
 
-#IPW Aalen
+p.num <- glm(qsmk ~ 1, data=data, family=binomial())
+data$pn.qsmk <- predict(p.num, data, type="response")
+
+data$sw.a2 <- ifelse(data$qsmk==1, data$pn.qsmk/data$pd.qsmk,
+                     (1-data$pn.qsmk)/(1-data$pd.qsmk))
+
 aalen_model_w = aareg(survival~ qsmk + sex + race + age + school + ht + wt82 + wt82_71 + smokeintensity + smokeyrs + pepticulcer + alcoholpy + otherpain  + exercise + marital,
-      data = nhefs, weights = sw.a2)
+      data = data, weights = sw.a2)
 
 times = aalen_model_w$times
 
@@ -271,57 +312,67 @@ BE1 = coef[,"exercise1"]
 BE2 = coef[,"exercise2"]
 BM = coef[,"marital"]
 
-n = nrow(nhefs)
+n = nrow(data)
 S0_mat = matrix(0, nrow = n, ncol = length(times))
 S1_mat = matrix(0, nrow = n, ncol = length(times))
 
 for (j in seq_along(times)) {
-  linpred0 =          BS[j]*(nhefs$sex == 1) +
-    BR[j]*(nhefs$race == 1) +
-    BA[j]*(nhefs$age == 1) +
-    BSc[j]*nhefs$school +
-    BH[j]*nhefs$ht +
-    BW[j]*nhefs$wt82 +
-    BWc[j]*nhefs$wt82_71 + 
-    BSi[j]*nhefs$smokeintensity +
-    BSy[j]*nhefs$smokeyrs +
-    #BP[j]*nhefs$price82 +
-    BPu[j]*nhefs$pepticulcer +
-    BAy[j]*nhefs$alcoholpy +
-    BO[j]*nhefs$otherpain +
-    BE1[j]*(nhefs$exercise == 1) +
-    BE2[j]*(nhefs$exercise == 2) +
-    BM[j]*nhefs$marital
-  linpred1 = Bqmk[j] +  BS[j]*(nhefs$sex == 1) +
-    BR[j]*(nhefs$race == 1) +
-    BA[j]*(nhefs$age == 1) +
-    BSc[j]*nhefs$school +
-    BH[j]*nhefs$ht +
-    BW[j]*nhefs$wt82 +
-    BWc[j]*nhefs$wt82_71 + 
-    BSi[j]*nhefs$smokeintensity +
-    BSy[j]*nhefs$smokeyrs +
-    #BP[j]*nhefs$price82 +
-    BPu[j]*nhefs$pepticulcer +
-    BAy[j]*nhefs$alcoholpy +
-    BO[j]*nhefs$otherpain +
-    BE1[j]*(nhefs$exercise == 1) +
-    BE2[j]*(nhefs$exercise == 2) +
-    BM[j]*nhefs$marital
+  linpred0 =          BS[j]*(data$sex == 1) +
+    BR[j]*(data$race == 1) +
+    BA[j]*(data$age == 1) +
+    BSc[j]*data$school +
+    BH[j]*data$ht +
+    BW[j]*data$wt82 +
+    BWc[j]*data$wt82_71 + 
+    BSi[j]*data$smokeintensity +
+    BSy[j]*data$smokeyrs +
+    #BP[j]*data$price82 +
+    BPu[j]*data$pepticulcer +
+    BAy[j]*data$alcoholpy +
+    BO[j]*data$otherpain +
+    BE1[j]*(data$exercise == 1) +
+    BE2[j]*(data$exercise == 2) +
+    BM[j]*data$marital
+  linpred1 = Bqmk[j] +  BS[j]*(data$sex == 1) +
+    BR[j]*(data$race == 1) +
+    BA[j]*(data$age == 1) +
+    BSc[j]*data$school +
+    BH[j]*data$ht +
+    BW[j]*data$wt82 +
+    BWc[j]*data$wt82_71 + 
+    BSi[j]*data$smokeintensity +
+    BSy[j]*data$smokeyrs +
+    #BP[j]*data$price82 +
+    BPu[j]*data$pepticulcer +
+    BAy[j]*data$alcoholpy +
+    BO[j]*data$otherpain +
+    BE1[j]*(data$exercise == 1) +
+    BE2[j]*(data$exercise == 2) +
+    BM[j]*data$marital
   
-  S0_mat[, j] <- exp(-Lambda0[j] - linpred0)
-  S1_mat[, j] <- exp(-Lambda0[j] - linpred1)
+  S0_mat[, j] <- exp(Lambda0[j] + linpred0)
+  S1_mat[, j] <- exp(Lambda0[j] + linpred1)
 }
 
 S0 <- colMeans(S0_mat,na.rm = TRUE)
 S1 <- colMeans(S1_mat, na.rm = TRUE)
 
-tau = max(times)
+cumprod(S0)[291]
+cumprod(S1)[291]
 
-rmst0 = sum( (S0[-1] + S0[-length(S0)])/2 * diff(times) )
-rmst1 = sum( (S1[-1] + S1[-length(S1)])/2 * diff(times) )
+return(cumprod(S1)[291] - cumprod(S0)[291])
+}
 
-ate_rmst = rmst1 - rmst0
+#Run bootstrap
+aalen_vals = vector("list",500)
+for(i in 1:500){
+  aalen_vals[i] = bootaalen()
+}
+
+aalen_vals2 = vector("list",500)
+for(i in 1:500){
+  aalen_vals2[i] = bootaalen()
+}
 ```
 
 ## Marginal Structural Models
@@ -384,5 +435,386 @@ rmst0_msm = sum( (S0[-1] + S0[-length(S0)])/2 )
 rmst1_msm = sum( (S1[-1] + S1[-length(S1)])/2 )
 
 ate_rmst_msm = (rmst1_msm - rmst0_msm) * (3653/120)
+```
+## Aalen II
+```{r}
+aalen_model_uw_II = aalen(survival~ qsmk + const(sex) + const(age) + const(wt71) + const(smokeintensity) + const(smokeyrs) +const(income),
+      data = nhefs)
+
+aalen_model_uw_base = aalen(survival~ qsmk,
+      data = nhefs)
+
+aalen_model_uw_III = aalen(survival~ qsmk,
+      data = nhefs, weights = nhefs$sw.a ,max.time = 3653,resample.iid = TRUE,n.sim = 500,id = nhefs$seqn)
+
+aalen_list = as.data.frame(aalen_model_uw_II$cum)
+
+aalen_list_covariates = aalen_model_uw_II$gamma
+
+means_covariates = nhefs %>% summarize(sex = mean(as.numeric(sex)),
+                                       age = mean(age),
+                                       wt71 = mean(wt71),
+                                       smokeintensity = mean(smokeintensity),
+                                       smokeyrs = mean(smokeyrs),
+                                       income = mean(income))
+
+covariate_factor = sum(unlist((as.matrix(means_covariates)) * t(as.matrix(aalen_list_covariates)))[1,])
+
+frame_aalen_uw = aalen_list %>% mutate(est_0 = exp(-`(Intercept)` - covariate_factor),est_1 = exp(-`(Intercept)` - qsmk - covariate_factor))
+
+tail(frame_aalen_uw$est_1,1) - tail(frame_aalen_uw$est_0,1)
+
+frame_pred_uw_62 = 
+
+aalen_list_II = as.data.frame(aalen_model_uw_III$cum)
+
+frame_aalen = aalen_list_II %>% mutate(est_0 = exp(-`(Intercept)`),est_1 = exp(-`(Intercept)` - qsmk))
+
+tail(frame_aalen$est_1,1) - tail(frame_aalen$est_0,1)
+
+aalen_list_base = as.data.frame(aalen_model_uw_base$cum)
+
+frame_aalen_base = aalen_list_base %>% mutate(est_0 = exp(-`(Intercept)`),est_1 = exp(-`(Intercept)` - qsmk))
+
+tail(frame_aalen_base$est_1,1) - tail(frame_aalen_base$est_0,1)
+
+boot_aalen = aalen_model_uw_III$B.iid
+
+predict.aalen(aalen_model_uw_III,nhefs)
+
+aalen_vals = vector("list",500)
+z = 1
+for(j in boot_aalen){
+  aalen_vals[z] = j[]
+  z = z +1
+}
+
+ggplot(frame_aalen_base,aes(time)) + 
+  geom_line(aes(y = est_0,colour = "est_0")) +
+  geom_line(aes(y = est_1,colour = "est_1")) +
+  labs(title = "Aalen Esimated Survival Curves for Unweighted Covariate Free Model") + 
+  ylab("Survival Probability") +
+  scale_color_hue(labels=c("est_0" = "qsmk = 0", "est_1"="qsmk = 1"))
+
+#roughly estimated standard error
+sqrt(sum(aalen_model_uw_base$var.cum[279,c(2,3)]))
+
+#estimate
+tail(frame_aalen_base$est_1,1) - tail(frame_aalen_base$est_0,1)
+
+ggplot(frame_aalen,aes(time)) + 
+  geom_line(aes(y = est_0,colour = "est_0")) +
+  geom_line(aes(y = est_1,colour = "est_1")) +
+  labs(title = "Aalen Esimated Survival Curves for Weighted Covariate Free Model") + 
+  ylab("Survival Probability") +
+  scale_color_hue(labels=c("est_0" = "qsmk = 0", "est_1"="qsmk = 1"))
+
+#roughly estimated standard error
+sqrt(sum(aalen_model_uw_III$var.cum[279,c(2,3)]))
+
+#estimate
+tail(frame_aalen$est_1,1) - tail(frame_aalen$est_0,1)
+
+ggplot(frame_aalen_uw,aes(time)) + 
+  geom_line(aes(y = est_0,colour = "est_0")) +
+  geom_line(aes(y = est_1,colour = "est_1")) +
+  labs(title = "Aalen Esimated Survival Curves for Unweighted Model with Covariates") + 
+  ylab("Survival Probability") +
+  scale_color_hue(labels=c("est_0" = "qsmk = 0", "est_1"="qsmk = 1"))
+
+#roughly estimated standard error
+sqrt(sum(c(as.matrix(means_covariates) %*% as.matrix(aalen_model_uw_II$var.gamma) %*% t(as.matrix(means_covariates)),aalen_model_uw_II$var.cum[279,c(2,3)])))
+
+#estimate
+tail(frame_aalen_uw$est_1,1) - tail(frame_aalen_uw$est_0,1)
+```
+
+## Cox Proportional Hazards
+
+```{r}
+cox_uw = coxph(survival ~ qsmk,data = nhefs, weights = sw.a2)
+
+surv_adjustedcurves(cox_uw,variable = qsmk,data = nhefs)
+```
+
+## Plugin and Doubly Robust Estimator
+
+```{r}
+#We need to estimate the conditional probability of treatment assignment and survival for each subject to adminstrative censoring
+
+#Creation of instrumental variable - change in price with tax #OLD
+#nhefs$price_change = nhefs$price71_82 + nhefs$tax71_82
+#nhefs$price_change[is.na(nhefs$price_change)] #<- mean(na.omit(nhefs$price_change)) #Set price change to 
+
+nhefs$hightax82[is.na(nhefs$hightax82)]<- 0
+cor(as.numeric(nhefs$hightax82),nhefs$qsmk)
+cor(as.numeric(nhefs$hightax82),nhefs$death)
+
+ci_cor(as.numeric(nhefs$hightax82),nhefs$qsmk)
+ci_cor(as.numeric(nhefs$hightax82),nhefs$death)
+
+#Probability of treatment assignment:
+qsmk_mod = glm(qsmk~ hightax82 + age + sex + wt71 + income + smokeintensity + smokeyrs,
+               data = nhefs, family = binomial)
+
+#Create matrix for imputation
+
+#old: imput_data = nhefs %>% select("sex","race","age","school","ht","wt82","wt82_71","smokeintensity","smokeyrs","pepticulcer","alcoholpy","otherpain","exercise","marital")
+imput_data = nhefs %>% select("sex","age","wt71","smokeintensity","smokeyrs","income")
+
+imput_data_1 = imput_data %>% mutate("hightax82" = 1)
+imput_data_0 = imput_data %>% mutate("hightax82" = 0)
+
+comp = data.frame(z1 = predict(qsmk_mod, newdata = imput_data_1,type = "response"),z0 = predict(qsmk_mod, newdata = imput_data_0,type = "response"))
+
+#Probability of survival (or death) to end of study:
+nhefs$live = 1 - nhefs$death
+death_mod = glm(death~ hightax82 + age + sex + wt71 + income + smokeintensity + smokeyrs,
+               data = nhefs, family = binomial)
+
+imput_data_1_d = imput_data %>% mutate("hightax82" = 1)
+imput_data_0_d = imput_data %>% mutate("hightax82" = 0)
+
+comp_d = data.frame(d1 = predict(death_mod, newdata = imput_data_1_d,type = "response"),d0 = predict(death_mod, newdata = imput_data_0_d,type = "response"))
+
+est_data = cbind(comp,comp_d)
+
+est_data$est = (est_data$d1 - est_data$d0)/(est_data$z1 - est_data$z0)
+
+#Plug-in Estimate:
+mean((est_data$d1 - est_data$d0)/(est_data$z1 - est_data$z0))
+
+#Doubly Robust was Abandoned- See paper
+```
+
+## Propensity Score Matching
+```{r}
+match_obj = matchit(qsmk~ hightax82 + sex + race + age + school + ht + wt82 + wt82_71 + smokeintensity + smokeyrs + pepticulcer + alcoholpy + otherpain  + exercise + marital,
+                    data = nhefs,method = "nearest", distance = "glm",
+                    ratio = 1, replace = FALSE)
+
+s_match = summary(match_obj)
+
+s_match$sum.matched
+print(xtable(s_match$sum.all, type = "latex"), file = "Initial_Cov_Balance_695.tex")
+print(xtable(s_match$sum.matched, type = "latex"), file = "Matched_Cov_Balance_695.tex")
+
+nhefs_match = match.data(match_obj)
+
+#Version 2
+match_obj_2 = matchit(qsmk~ age + wt82_71,
+                    data = nhefs,method = "nearest", distance = "glm",
+                    ratio = 1, replace = FALSE)
+
+s_match_2 = summary(match_obj_2)
+
+print(xtable(s_match$sum.all, type = "latex"), file = "Initial_Cov_Balance_695.tex")
+print(xtable(s_match$sum.matched, type = "latex"), file = "Matched_Cov_Balance_695.tex")
+
+nhefs_match_2 = match.data(match_obj_2)
+
+#Version 3
+match_obj_3 = matchit(qsmk~ + age + sex + wt71 + income + smokeintensity + smokeyrs,
+                    data = nhefs,method = "nearest", distance = "glm",
+                    ratio = 1, replace = FALSE, )
+
+s_match_3 = summary(match_obj_3)
+
+print(xtable(s_match_3$sum.all, type = "latex"), file = "Initial_Cov_Balance_695.tex")
+print(xtable(s_match_3$sum.matched, type = "latex"), file = "Matched_Cov_Balance_695.tex")
+
+nhefs_match_3 = match.data(match_obj_3)
+```
+
+## Analysis with Propensity Matching
+
+```{r}
+#Aalen on Matched
+aalen_model_matched = aalen(survival~ qsmk,
+      data = nhefs_match,resample.iid = TRUE,n.sim = 500,id = nhefs_match$seqn)
+
+aalen_list_matched = as.data.frame(aalen_model_matched$cum)
+
+frame_aalen_match = aalen_list_matched %>% mutate(est_0 = exp(-`(Intercept)`),est_1 = exp(-`(Intercept)` - qsmk))
+
+tail(frame_aalen_match$est_1,1) - tail(frame_aalen_match$est_0,1)
+
+ggplot(frame_aalen_match,aes(time)) + 
+  geom_line(aes(y = est_0,colour = "est_0")) +
+  geom_line(aes(y = est_1,colour = "est_1")) +
+  labs(title = "Aalen Esimated Survival Curves for Propensity Matching") + 
+  ylab("Survival Probability") +
+  scale_color_hue(labels=c("est_0" = "qsmk = 0", "est_1"="qsmk = 1"))
+
+#Aalen on Matched Version 2
+aalen_model_matched_2 = aalen(survival~ qsmk,
+      data = nhefs_match_2,resample.iid = TRUE,n.sim = 500,id = nhefs_match_2$seqn)
+
+aalen_list_matched_2 = as.data.frame(aalen_model_matched_2$cum)
+
+frame_aalen_match_2 = aalen_list_matched_2 %>% mutate(est_0 = exp(-`(Intercept)`),est_1 = exp(-`(Intercept)` - qsmk))
+
+tail(frame_aalen_match_2$est_1,1) - tail(frame_aalen_match_2$est_0,1)
+
+ggplot(frame_aalen_match_2,aes(time)) + 
+  geom_line(aes(y = est_0,colour = "est_0")) +
+  geom_line(aes(y = est_1,colour = "est_1")) +
+  labs(title = "Aalen Esimated Survival Curves for Propensity Matching") + 
+  ylab("Survival Probability") +
+  scale_color_hue(labels=c("est_0" = "qsmk = 0", "est_1"="qsmk = 1"))
+
+#Aalen on Matched Version 3
+aalen_model_matched_3 = aalen(survival~ qsmk,
+      data = nhefs_match_3,resample.iid = TRUE,n.sim = 500,id = nhefs_match_3$seqn)
+
+aalen_list_matched_3 = as.data.frame(aalen_model_matched_3$cum)
+
+frame_aalen_match_3 = aalen_list_matched_3 %>% mutate(est_0 = exp(-`(Intercept)`),est_1 = exp(-`(Intercept)` - qsmk))
+
+tail(frame_aalen_match_3$est_1,1) - tail(frame_aalen_match_3$est_0,1)
+
+ggplot(frame_aalen_match_3,aes(time)) + 
+  geom_line(aes(y = est_0,colour = "est_0")) +
+  geom_line(aes(y = est_1,colour = "est_1")) +
+  labs(title = "Aalen Esimated Survival Curves for Propensity Matching") + 
+  ylab("Survival Probability") +
+  scale_color_hue(labels=c("est_0" = "qsmk = 0", "est_1"="qsmk = 1"))
+
+#roughly estimated standard error
+std_error_aalenweighted = sqrt(sum(aalen_model_matched_3$var.cum[-1,c(2,3)]))
+sqrt(sum(aalen_model_matched_3$var.cum[159,c(2,3)]))
+
+```
+
+## Logistic with Maching
+
+```{r}
+#No matching
+glm_match = glm(death~ qsmk + age + sex + wt71 + income + smokeintensity + smokeyrs,
+               data = nhefs, family = binomial)
+
+imput_data = nhefs %>% select("sex","age","wt71","smokeintensity","smokeyrs","income")
+
+imput_data_1_q = imput_data %>% mutate("qsmk" = 1)
+imput_data_0_q = imput_data %>% mutate("qsmk" = 0)
+
+hat_s1 = predict(glm_match,imput_data_1_q,type = "response")
+hat_s0 = predict(glm_match,imput_data_0_q,type = "response")
+
+mean(hat_s1 - hat_s0)
+
+#Matching
+glm_matched = glm(death~ qsmk + age + sex + wt71 + income + smokeintensity + smokeyrs,
+               data = nhefs_match_3, family = binomial)
+
+hat_s12 = predict(glm_matched,imput_data_1_q,type = "response")
+hat_s02 = predict(glm_matched,imput_data_0_q,type = "response")
+
+mean(hat_s12 - hat_s02)
+```
+
+## Bootstrap
+
+```{r}
+bootlog <- function(){
+  sam = sample(nhefs_match_3$seqn,length(unique(nhefs_match_3$seqn)),replace = TRUE)
+   data = nhefs %>% filter(seqn %in% sam)
+  data <- data %>%
+    group_by(seqn) %>%
+    mutate(dup = sum(seqn == sam)) %>%
+    ungroup() %>%
+    uncount(weights = dup)
+
+glm_boot = glm(death~ qsmk + age + sex + wt71 + income + smokeintensity + smokeyrs,
+               data = data, family = binomial)
+
+hat_s12_boot = predict(glm_boot,imput_data_1_q,type = "response")
+hat_s02_boot = predict(glm_boot,imput_data_0_q,type = "response")
+
+return(mean(hat_s12_boot - hat_s02_boot))
+}
+
+boot_list = vector("list",500)
+for(i in 1:500){
+  boot_list[i] = bootlog()
+}
+
+sd(unlist(boot_list))
+```
+
+
+## Weighting Code
+
+```{r}
+library(tableone)
+# Define variables you want in the table
+vars <- c("wt71", "income", "sex", "age","smokeintensity","smokeyrs")
+
+# Define the factor variable to stratify by (e.g., treatment group)
+
+
+# Create Table 1 (basic)
+table1 <- CreateTableOne(vars = vars, strata = "qsmk", data = nhefs)
+
+# Print Table 1
+print(table1, showAllLevels = TRUE,latex = T)
+nhefs = nhefs[c("wt71","income","age","sex","smokeintensity","smokeyrs","qsmk","surv","death")]
+nhefs = na.omit(nhefs)
+ps_model <- glm(qsmk ~wt71 + income + sex + age + smokeintensity + smokeyrs, 
+                data = nhefs, family = binomial(link = "logit") )
+ps <- predict(ps_model, type = "response")
+ipw <- ifelse(nhefs$qsmk == 1, 1/ps, 1/(1-ps))
+p_treat = mean(nhefs$qsmk)
+sw12 <- ifelse(nhefs$qsmk == 1, p_treat/ps, (1-p_treat)/(1-ps))
+ow <- ifelse(nhefs$qsmk == 1, 1-ps,ps)
+
+nhefs$ps = ps
+
+ggplot(nhefs) + geom_histogram(aes(x = ps, col = as.factor(qsmk)))+facet_wrap(~ as.factor(qsmk), scales = "free") +
+  theme_minimal()
+
+km_ipw = survfit(Surv(as.numeric(surv),death) ~ qsmk, data = nhefs, weights = ipw)
+km_ipw %>% ggsurvfit()
+
+km_sw <- survfit(Surv(as.numeric(surv),death) ~ qsmk, data = nhefs, weights = sw12)
+km_sw %>% ggsurvfit()
+
+km_regular <-survfit(Surv(as.numeric(surv),death) ~ qsmk, data = nhefs)
+km_regular %>% ggsurvfit()
+
+km_sw$surv[c(193,279)]
+km_sw$std.err[c(193,279)]
+km_ipw$surv[c(193,279)]
+km_ipw$std.err[c(193,279)]
+## estimate 
+0.82905 - 0.7657625
+## se
+sqrt(0.0110976413^2+0.0227964189^2)
+
+### overlap weighting
+
+km_ow <- survfit(Surv(as.numeric(surv),death) ~ qsmk, data = nhefs, weights = ow)
+km_ow %>% ggsurvfit()
+##
+##estimate
+sum(c(1,-1)*km_ow$surv[c(193,279)])
+sqrt(sum(km_ow$std.err[c(193,279)]^2))
+##
+sum(c(1,-1)*km_ipw$surv[c(193,279)])
+sqrt(sum(km_ipw$std.err[c(193,279)]^2))
+##
+sum(c(1,-1)*km_regular$surv[c(193,279)])
+sqrt(sum(km_regular$std.err[c(193,279)]^2))
+## IPTW+IPCW
+library(pec)
+ipcw_out <- ipcw(Surv(as.numeric(surv),1-death) ~ qsmk+age+sex,
+                 data = nhefs,
+                 method = "nonpar",
+                 times = as.numeric(nhefs$surv))
+a = 1/(ipcw_out$IPCW.subjectTimes)*ipw
+km_ipctw <- survfit(Surv(as.numeric(surv),death) ~ qsmk, data = nhefs, weights = a)
+km_ipctw %>% ggsurvfit()                
+sum(c(1,-1)*km_ipctw$surv[c(193,279)])
+sum(km_ipctw$std.err[c(193,279)]^2)^(0.5)
 ```
 
